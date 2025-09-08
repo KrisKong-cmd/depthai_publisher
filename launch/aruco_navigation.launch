@@ -1,0 +1,74 @@
+<!-- aruco_navigation_robust.launch -->
+<launch>
+    <!-- Flight Mode Parameter: "simulation" or "real" -->
+    <arg name="flight_mode" default="simulation" />
+    
+    <!-- Determine pose topic based on flight mode -->
+    <arg name="drone_pose_topic" value="/uavasr/pose" if="$(eval arg('flight_mode') == 'simulation')" />
+    <arg name="drone_pose_topic" value="/mavros/local_position/pose" if="$(eval arg('flight_mode') == 'real')" />
+    
+    <!-- Display current configuration -->
+    <param name="/flight_mode" value="$(arg flight_mode)" />
+    <param name="/drone_pose_topic" value="$(arg drone_pose_topic)" />
+    
+    <!-- Include Breadcrumb launch file from catkin_ws/launch -->
+    <include file="$(env HOME)/catkin_ws/launch/breadcrumb.launch" />
+    
+    <!-- Clean up any existing DepthAI processes first -->
+    <node name="cleanup_depthai" pkg="depthai_publisher" type="cleanup_depthai.sh" output="screen" />
+    
+    <!-- Small delay after cleanup -->
+    <arg name="node_start_delay" default="3.0" />
+    
+    <!-- Payload Configuration GUI - Start this first so config is available -->
+    <node name="payload_config_gui" pkg="depthai_publisher" type="payload_config_gui.py" 
+          output="screen" required="false">
+        <param name="default_payload" value="tino" />
+    </node>
+    
+    <!-- Camera Detection System with wrapper for error handling -->
+    <node name="depthai_yolo_aruco" pkg="depthai_publisher" type="dai_publisher_yolov5_wrapper.py" 
+          output="screen" respawn="false" launch-prefix="bash -c 'sleep $(arg node_start_delay); $0 $@' ">
+        <!-- Camera parameters -->
+        <param name="camera_fov_h" value="69.4" />
+        <param name="camera_fov_v" value="42.5" />
+        <param name="camera_offset_x" value="0.15" />
+        <param name="camera_offset_y" value="0.0" />
+        <!-- Pass the pose topic to the node -->
+        <param name="drone_pose_topic" value="$(arg drone_pose_topic)" />
+    </node>
+    
+    <!-- ArUco Storage and Navigation Node -->
+    <node name="aruco_storage_navigation" pkg="depthai_publisher" type="aruco_storage_navigation.py" 
+          output="screen" launch-prefix="bash -c 'sleep $(arg node_start_delay); $0 $@' ">
+        <!-- Camera offset parameters -->
+        <param name="camera_offset_x" value="0.15" />
+        <param name="camera_offset_y" value="0.0" />
+        
+        <!-- Navigation parameters -->
+        <param name="hover_altitude" value="0.5" />
+        <param name="approach_speed" value="0.3" />
+        <param name="landing_speed" value="0.2" />
+        <param name="position_accuracy" value="0.15" />
+        <param name="yaw_accuracy" value="0.2" />
+        <param name="averaging_window" value="3.0" />
+        <param name="action_topic" value="spar/flight" />
+        
+        <!-- Pass the pose topic to the node -->
+        <param name="drone_pose_topic" value="$(arg drone_pose_topic)" />
+    </node>
+    
+    <!-- Payload Servo Controller Node -->
+    <node name="payload_controller" pkg="depthai_publisher" type="payload_controller.py" 
+          output="screen" launch-prefix="bash -c 'sleep $(arg node_start_delay); $0 $@' ">
+        <param name="servo_pin" value="12" />
+        <param name="min_pulse" value="500" />
+        <param name="max_pulse" value="2500" />
+        <param name="neutral_angle" value="90" />
+    </node>
+    
+    <!-- Print configuration info at startup -->
+    <node name="print_config" pkg="rostopic" type="rostopic" 
+          args="echo -n1 'Flight mode: $(arg flight_mode), Pose topic: $(arg drone_pose_topic)'" 
+          output="screen" />
+</launch>

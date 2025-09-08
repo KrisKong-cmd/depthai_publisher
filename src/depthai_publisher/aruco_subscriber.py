@@ -48,17 +48,33 @@ class ArucoDetector():
                 corners = marker_corner.reshape((4, 2))
                 (top_left, top_right, bottom_right, bottom_left) = corners
 
+                 # Calculate center coordinates
+                center_x = int((top_left[0] + bottom_right[0]) / 2)
+                center_y = int((top_left[1] + bottom_right[1]) / 2)
+
                 top_right = (int(top_right[0]), int(top_right[1]))
                 bottom_right = (int(bottom_right[0]), int(bottom_right[1]))
                 bottom_left = (int(bottom_left[0]), int(bottom_left[1]))
                 top_left = (int(top_left[0]), int(top_left[1]))
 
+                # Draw the marker boundary
                 cv2.line(frame, top_left, top_right, (0, 255, 0), 2)
                 cv2.line(frame, top_right, bottom_right, (0, 255, 0), 2)
                 cv2.line(frame, bottom_right, bottom_left, (0, 255, 0), 2)
                 cv2.line(frame, bottom_left, top_left, (0, 255, 0), 2)
+               
+                # Draw the center point
+                cv2.circle(frame, (center_x, center_y), 5, (0, 0, 255), -1)
+               # Display coordinates
+                coord_text = f"({center_x}, {center_y})"
+                cv2.putText(frame, coord_text,(center_x + 10, center_y),cv2.FONT_HERSHEY_SIMPLEX,0.5, (0, 0, 255), 2)    
 
-                rospy.loginfo("Aruco detected, ID: {}".format(marker_ID))
+                #rospy.loginfo("Aruco detected, ID: {}".format(marker_ID))
+                
+                # Update the terminal output to include coordinates
+                rospy.loginfo("Aruco detected, ID: {} at coordinates (x,y): ({}, {})".format(
+                marker_ID, center_x, center_y))
+
 
                 cv2.putText(frame, str(
                     marker_ID), (top_left[0], top_right[1] - 15), cv2.FONT_HERSHEY_COMPLEX, 0.5, (0, 255, 0), 2)

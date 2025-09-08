@@ -1,0 +1,640 @@
+#!/usr/bin/env python3
+
+'''
+Run as:
+# check model path line ~30 is
+rosrun depthai_publisher dai_publisher_yolov5_runner
+'''
+from std_msgs.msg import Header
+############################### ############################### Libraries ###############################
+from pathlib import Path
+import threading
+import csv
+import argparse
+import time
+import sys
+import json     # Yolo conf use json files
+import cv2
+import numpy as np
+import depthai as dai
+import rospy
+from sensor_msgs.msg import CompressedImage, Image, CameraInfo
+from geometry_msgs.msg import PoseStamped, Point
+from std_msgs.msg import Int32, String
+from cv_bridge import CvBridge, CvBridgeError
+
+############################### ############################### Parameters ###############################
+# Global variables to deal with pipeline creation
+pipeline = None
+cam_source = 'rgb' #'rgb', 'left', 'right'
+cam=None
+# sync outputs
+syncNN = True
+# model path
+modelsPath = "/home/ledrone/catkin_ws/src/depthai_publisher/src/depthai_publisher/models"
+modelName = 'best_openvino_2022.1_6shave'
+confJson = 'best.json'
+
+# Global Have already detected?
+fire_detected = False
+smoke_detected = False
+human_detected = False
+bag_detected = False
+
+################################  Yolo Config File
+# parse config
+configPath = Path(f'{modelsPath}/{modelName}/{confJson}')
+if not configPath.exists():
+    raise ValueError("Path {} does not exist!".format(configPath))
+
+with configPath.open() as f:
+    config = json.load(f)
+nnConfig = config.get("nn_config", {})
+
+# Extract metadata
+metadata = nnConfig.get("NN_specific_metadata", {})
+classes = metadata.get("classes", {})
+coordinates = metadata.get("coordinates", {})
+anchors = metadata.get("anchors", {})
+anchorMasks = metadata.get("anchor_masks", {})
+iouThreshold = metadata.get("iou_threshold", {})
+confidenceThreshold = metadata.get("confidence_threshold", {})
+# Parse labels
+nnMappings = config.get("mappings", {})
+labels = nnMappings.get("labels", [])
+
+# Helper for safe label lookup
+def get_label_name(class_id):
+    return labels[class_id] if 0 <= class_id < len(labels) else "Unknown"
+
+# Distinct BGR colors per class index (aligned with 'labels' list order)
+CLASS_COLORS = {
+    0: (0, 255, 0),    # Bag - green
+    1: (0, 0, 255),    # Fire - red
+    2: (255, 0, 0),    # Human - blue
+    3: (0, 255, 255),  # Smoke - yellow
+}
+
+class DepthaiCamera():
+    # res = [416, 416]
+    fps = 20.0
+
+    pub_topic = '/depthai_node/image/compressed'
+    pub_topic_raw = '/depthai_node/image/raw'
+    pub_topic_detect = '/depthai_node/detection/compressed'
+    pub_topic_cam_inf = '/depthai_node/camera/camera_info'
+    
+    # ArUco detection topic
+    pub_topic_aruco = '/processed_aruco/image/compressed'
+
+    def __init__(self):
+        self.pipeline = dai.Pipeline()
+
+         # Input image size
+        if "input_size" in nnConfig:
+            self.nn_shape_w, self.nn_shape_h = tuple(map(int, nnConfig.get("input_size").split('x')))
+        
+        # Publish speak stuff
+        self.tts_pub = rospy.Publisher('/speak_this', String, queue_size=10)
+        self.last_spoken = {}  # cooldown tracker
+        self.cooldown = rospy.Duration(30.0)
+        
+        
+        # Publish ros image data
+        self.pub_image = rospy.Publisher(self.pub_topic, CompressedImage, queue_size=10)
+        self.pub_image_raw = rospy.Publisher(self.pub_topic_raw, Image, queue_size=10)
+        self.pub_image_detect = rospy.Publisher(self.pub_topic_detect, CompressedImage, queue_size=10)
+        self.pub_cam_inf = rospy.Publisher(self.pub_topic_cam_inf, CameraInfo, queue_size=10)
+        
+        # ArUco publisher
+        self.pub_aruco = rospy.Publisher(self.pub_topic_aruco, CompressedImage, queue_size=10)
+        
+        # ROI Detection publishers - separate topic for each class
+        self.pub_roi_bag = rospy.Publisher('/yolo_detection/roi/bag', PoseStamped, queue_size=10)
+        self.pub_roi_fire = rospy.Publisher('/yolo_detection/roi/fire', PoseStamped, queue_size=10)
+        self.pub_roi_human = rospy.Publisher('/yolo_detection/roi/human', PoseStamped, queue_size=10)
+        self.pub_roi_smoke = rospy.Publisher('/yolo_detection/roi/smoke', PoseStamped, queue_size=10)
+        
+        # ArUco ROI publisher
+        self.pub_roi_aruco = rospy.Publisher('/aruco_detection/roi', PoseStamped, queue_size=10)
+        
+        # General ROI publisher (publishes all detections)
+        self.pub_roi_all = rospy.Publisher('/yolo_detection/roi/all', PoseStamped, queue_size=10)
+        
+        # Publisher for detection summary
+        self.pub_detection_summary = rospy.Publisher('/yolo_detection/summary', String, queue_size=10)
+        
+        # Publisher for target detection ROI
+        self.pub_target_detection_roi = rospy.Publisher('/target_detection/roi', PoseStamped, queue_size=10)
+        
+        # CameraInfo publishing timer
+        self.timer = rospy.Timer(rospy.Duration(1.0 / 10), self.publish_camera_info, oneshot=False)
+
+        rospy.loginfo("Publishing images to rostopic: {}".format(self.pub_topic))
+        rospy.loginfo("Publishing ROI positions to class-specific topics:")
+        rospy.loginfo("  /yolo_detection/roi/bag")
+        rospy.loginfo("  /yolo_detection/roi/fire") 
+        rospy.loginfo("  /yolo_detection/roi/human")
+        rospy.loginfo("  /yolo_detection/roi/smoke")
+        rospy.loginfo("  /yolo_detection/roi/all (all detections)")
+        rospy.loginfo("  /aruco_detection/roi (ArUco markers)")
+        rospy.loginfo("Publishing RViz visualization markers:")
+        rospy.loginfo("  /ml_targets/visualization (ML target 3D markers)")
+
+        self.br = CvBridge()
+        
+        # Initialize ArUco detector
+        self.aruco_dict = cv2.aruco.Dictionary_get(cv2.aruco.DICT_4X4_100)
+        self.aruco_params = cv2.aruco.DetectorParameters_create()
+        
+        # Tracking and world position calculation parameters
+        self.current_pose = None
+        self.last_detection_time = {}
+        self.detection_timeout = rospy.Duration(2.0)
+        self.min_confidence = 0.7
+        
+        # Track ROI publications per frame for each class
+        self.roi_published_this_frame = {0: False, 1: False, 2: False, 3: False}
+        
+        # Track ArUco detections
+        self.aruco_detections = {}
+        
+        # Camera parameters for pixel-to-world conversion
+        self.camera_fov_h = rospy.get_param("~camera_fov_h", 69.4)
+        self.camera_fov_v = rospy.get_param("~camera_fov_v", 42.5)
+        self.camera_offset_x = rospy.get_param("~camera_offset_x", 0.0)
+        self.camera_offset_y = rospy.get_param("~camera_offset_y", 0.0)
+        
+        # Get the drone pose topic from parameter (can be /uavasr/pose for sim or /mavros/local_position/pose for real)
+        self.drone_pose_topic = rospy.get_param("~drone_pose_topic", "/uavasr/pose")
+        
+        # Class-specific publishers mapping
+        self.class_publishers = {
+            0: self.pub_roi_bag,
+            1: self.pub_roi_fire,
+            2: self.pub_roi_human,
+            3: self.pub_roi_smoke
+        }
+        
+        # Subscribers
+        self.sub_pose = rospy.Subscriber(self.drone_pose_topic, PoseStamped, self.pose_callback)
+
+        rospy.on_shutdown(lambda: self.shutdown())
+        
+        rospy.loginfo("YOLO Multi-Class Detection with ROI Publishing and ArUco Detection initialized")
+        rospy.loginfo(f"Detecting all classes: {', '.join([f'{i}={name}' for i, name in enumerate(labels)])}")
+        rospy.loginfo(f"Minimum confidence threshold: {self.min_confidence}")
+        rospy.loginfo("ArUco dictionary: DICT_4X4_100")
+        rospy.loginfo(f"Using drone pose topic: {self.drone_pose_topic}")
+
+    def should_speak(self, key):
+        now = rospy.Time.now()
+        if key not in self.last_spoken or (now - self.last_spoken[key]) > self.cooldown:
+            self.last_spoken[key] = now
+            return True
+        return False
+
+    def pose_callback(self, msg):
+        self.current_pose = msg
+    
+    def pixel_to_world(self, pixel_x, pixel_y):
+        if not self.current_pose:
+            return None
+        
+        drone_height = self.current_pose.pose.position.z
+        
+        norm_x = (2.0 * pixel_x / self.nn_shape_w) - 1.0
+        norm_y = -((2.0 * pixel_y / self.nn_shape_h) - 1.0)
+        
+        angle_x = np.radians(self.camera_fov_h / 2.0) * norm_x
+        angle_y = np.radians(self.camera_fov_v / 2.0) * norm_y
+        
+        ground_offset_x = drone_height * np.tan(angle_x)
+        ground_offset_y = drone_height * np.tan(angle_y)
+        
+        world_x = self.current_pose.pose.position.x + ground_offset_x + self.camera_offset_x
+        world_y = self.current_pose.pose.position.y + ground_offset_y + self.camera_offset_y
+        
+        return (world_x, world_y)
+    
+    def publish_roi_detection(self, center_x, center_y, class_id, confidence):
+        world_pos = self.pixel_to_world(center_x, center_y)
+        
+        label = get_label_name(class_id)
+        
+      
+            
+        """Publish ROI detection for a specific class"""
+        if not self.current_pose:
+            return
+        
+        key = f"{label}_{int(world_pos[0]*10)}_{int(world_pos[1]*10)}"  # round pos for cooldown
+        message = f"{label} detected at {world_pos[0]:.1f}, {world_pos[1]:.1f}"
+        if self.should_speak(key):
+            self.tts_pub.publish(message)
+        
+        
+        
+        if world_pos:
+            roi_msg = PoseStamped()
+            roi_msg.header.stamp = rospy.Time.now()
+            roi_msg.header.frame_id = "map"
+            roi_msg.pose.position.x = world_pos[0]
+            roi_msg.pose.position.y = world_pos[1]
+            roi_msg.pose.position.z = 0.5  # Default ROI altitude
+            roi_msg.pose.orientation.w = 1.0
+            
+            # Publish to class-specific topic
+            if class_id in self.class_publishers:
+                self.class_publishers[class_id].publish(roi_msg)
+            
+            # Also publish to general all-detections topic
+            self.pub_roi_all.publish(roi_msg)
+            
+            # Publish to target detection ROI topic
+            self.pub_target_detection_roi.publish(roi_msg)
+            
+            rospy.loginfo(f"ROI: {get_label_name(class_id)} at ({world_pos[0]:.2f}, {world_pos[1]:.2f}) conf:{confidence:.2f}")
+    
+    def publish_aruco_roi(self, center_x, center_y, marker_id):
+        
+        
+        """Publish ROI detection for ArUco marker with ID in header"""
+    
+        if not self.current_pose:
+            return
+    
+        world_pos = self.pixel_to_world(center_x, center_y)
+        
+        
+        # aruco vocal stuff
+        key = f"aruco_{marker_id}"
+        message = f"ArUco marker {marker_id} at {world_pos[0]:.1f}, {world_pos[1]:.1f}"
+        if self.should_speak(key):
+            self.tts_pub.publish(message)
+
+        
+        
+        if world_pos:
+            roi_msg = PoseStamped()
+            roi_msg.header.stamp = rospy.Time.now()
+            roi_msg.header.frame_id = f"aruco_{marker_id}"  # Encode marker ID in frame_id
+            roi_msg.pose.position.x = world_pos[0]
+            roi_msg.pose.position.y = world_pos[1]
+            roi_msg.pose.position.z = 0.5  # Default ROI altitude
+            roi_msg.pose.orientation.w = 1.0
+        
+        # Publish to ArUco-specific topic
+            self.pub_roi_aruco.publish(roi_msg)
+        
+        # Also publish to general all-detections topic
+            self.pub_roi_all.publish(roi_msg)
+        
+        # Publish to target detection ROI topic
+            self.pub_target_detection_roi.publish(roi_msg)
+        
+            rospy.loginfo(f"ArUco ID:{marker_id} at pixel({center_x}, {center_y}) -> world({world_pos[0]:.2f}, {world_pos[1]:.2f})")
+
+    def detect_aruco(self, frame):
+        """Detect ArUco markers in frame and return annotated frame"""
+        aruco_frame = frame.copy()
+        self.aruco_detections = {}  # Reset detections for this frame
+        
+        (corners, ids, _) = cv2.aruco.detectMarkers(
+            frame, self.aruco_dict, parameters=self.aruco_params)
+        
+        if len(corners) > 0:
+            ids = ids.flatten()
+            
+            for (marker_corner, marker_ID) in zip(corners, ids):
+                corners_reshaped = marker_corner.reshape((4, 2))
+                (top_left, top_right, bottom_right, bottom_left) = corners_reshaped
+                
+                # Calculate center coordinates
+                center_x = int((top_left[0] + bottom_right[0]) / 2)
+                center_y = int((top_left[1] + bottom_right[1]) / 2)
+                
+                # Store detection info
+                self.aruco_detections[marker_ID] = (center_x, center_y)
+                
+                # Convert corners to integer coordinates
+                top_right = (int(top_right[0]), int(top_right[1]))
+                bottom_right = (int(bottom_right[0]), int(bottom_right[1]))
+                bottom_left = (int(bottom_left[0]), int(bottom_left[1]))
+                top_left = (int(top_left[0]), int(top_left[1]))
+                
+                # Draw the marker boundary (green lines)
+                cv2.line(aruco_frame, top_left, top_right, (0, 255, 0), 2)
+                cv2.line(aruco_frame, top_right, bottom_right, (0, 255, 0), 2)
+                cv2.line(aruco_frame, bottom_right, bottom_left, (0, 255, 0), 2)
+                cv2.line(aruco_frame, bottom_left, top_left, (0, 255, 0), 2)
+                
+                # Draw the center point (red)
+                cv2.circle(aruco_frame, (center_x, center_y), 5, (0, 0, 255), -1)
+                
+                # Calculate world coordinates
+                world_pos = self.pixel_to_world(center_x, center_y)
+                
+                # Display pixel coordinates
+                coord_text = f"px:({center_x}, {center_y})"
+                cv2.putText(aruco_frame, coord_text, (center_x + 10, center_y),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 0, 255), 1)
+                
+                # Display world coordinates if available
+                if world_pos:
+                    world_text = f"w:({world_pos[0]:.2f}, {world_pos[1]:.2f})"
+                    cv2.putText(aruco_frame, world_text, (center_x + 10, center_y + 15),
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 255), 1)
+                
+                # Display marker ID
+                cv2.putText(aruco_frame, f"ArUco:{marker_ID}", 
+                           (top_left[0], top_left[1] - 15), 
+                           cv2.FONT_HERSHEY_COMPLEX, 0.5, (0, 255, 0), 2)
+                
+                # Publish ROI for this ArUco marker
+                self.publish_aruco_roi(center_x, center_y, marker_ID)
+        
+        return aruco_frame
+
+    def publish_camera_info(self, timer=None):
+        camera_info_msg = CameraInfo()
+        camera_info_msg.header.frame_id = "camera_frame"
+        camera_info_msg.height = self.nn_shape_h
+        camera_info_msg.width = self.nn_shape_w
+        camera_info_msg.K = [615.381, 0.0, 320.0, 0.0, 615.381, 240.0, 0.0, 0.0, 1.0]
+        camera_info_msg.D = [-0.10818, 0.12793, 0.00000, 0.00000, -0.04204]
+        camera_info_msg.R = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]
+        camera_info_msg.P = [615.381, 0.0, 320.0, 0.0, 0.0, 615.381, 240.0, 0.0, 0.0, 0.0, 1.0, 0.0]
+        camera_info_msg.distortion_model = "plumb_bob"
+        camera_info_msg.header.stamp = rospy.Time.now()
+        self.pub_cam_inf.publish(camera_info_msg)
+
+    def run(self):
+        modelPathName = f'{modelsPath}/{modelName}/{modelName}.blob'
+        nnPath = str((Path(__file__).parent / Path(modelPathName)).resolve().absolute())
+        pipeline = self.createPipeline(nnPath)
+
+        with dai.Device() as device:
+            cams = device.getConnectedCameras()
+            depth_enabled = dai.CameraBoardSocket.LEFT in cams and dai.CameraBoardSocket.RIGHT in cams
+            if cam_source != "rgb" and not depth_enabled:
+                raise RuntimeError(f"Unable to run the experiment on {cam_source} camera! Available: {cams}")
+            device.startPipeline(pipeline)
+
+            q_nn_input = device.getOutputQueue(name="nn_input", maxSize=4, blocking=False)
+            q_nn = device.getOutputQueue(name="nn", maxSize=4, blocking=False)
+
+            frame = None
+            detections = []
+            start_time = time.time()
+            counter = 0
+            fps = 0
+
+            while True:
+                found_classes = []
+                # Reset ROI publication flags for this frame
+                self.roi_published_this_frame = {0: False, 1: False, 2: False, 3: False}
+                
+                inRgb = q_nn_input.get()
+                inDet = q_nn.get()
+
+                if inRgb is not None:
+                    frame = inRgb.getCvFrame()
+                else:
+                    continue
+                
+                # Process YOLO detections
+                if inDet is not None:
+                    detections = inDet.detections
+                    
+                    # Find best detection for each class
+                    best_detections = {0: None, 1: None, 2: None, 3: None}
+                    best_confidences = {0: 0, 1: 0, 2: 0, 3: 0}
+                    
+                    for detection in detections:
+                        found_classes.append(detection.label)
+                        
+                        # Check if this is the best detection for this class
+                        if (detection.confidence > self.min_confidence and 
+                            detection.confidence > best_confidences[detection.label]):
+                            best_detections[detection.label] = detection
+                            best_confidences[detection.label] = detection.confidence
+                    
+                    found_classes = np.unique(found_classes)
+                    
+                    # Publish ROI for best detection of each class
+                    detection_summary = []
+                    for class_id in range(4):  # Process all 4 classes
+                        detection = best_detections[class_id]
+                        if detection and not self.roi_published_this_frame[class_id]:
+                            bbox = self.frameNorm(frame, (detection.xmin, detection.ymin, 
+                                                          detection.xmax, detection.ymax))
+                            center_x = int((bbox[0] + bbox[2]) / 2)
+                            center_y = int((bbox[1] + bbox[3]) / 2)
+                            
+                            self.publish_roi_detection(center_x, center_y, 
+                                                      detection.label, detection.confidence)
+                            self.roi_published_this_frame[class_id] = True
+                            
+                            # Add to summary
+                            world_pos = self.pixel_to_world(center_x, center_y)
+                            if world_pos:
+                                detection_summary.append(f"{get_label_name(class_id)}@({world_pos[0]:.1f},{world_pos[1]:.1f})")
+                    
+                    # Add ArUco detections to summary if any
+                    if self.aruco_detections:
+                        for marker_id, (cx, cy) in self.aruco_detections.items():
+                            world_pos = self.pixel_to_world(cx, cy)
+                            if world_pos:
+                                detection_summary.append(f"ArUco{marker_id}@({world_pos[0]:.1f},{world_pos[1]:.1f})")
+                    
+                    # Publish detection summary
+                    if detection_summary:
+                        summary_msg = String()
+                        summary_msg.data = " | ".join(detection_summary)
+                        self.pub_detection_summary.publish(summary_msg)
+                    
+                    # Create overlay with YOLO detections
+                    overlay = self.show_yolo(frame, detections)
+                else:
+                    overlay = frame.copy()
+
+                # Detect and overlay ArUco markers on the same frame
+                if frame is not None:
+                    # Detect ArUco markers and get annotated frame
+                    aruco_overlay = self.detect_aruco(overlay)
+                    
+                    # Add FPS and status information
+                    cv2.putText(aruco_overlay, "NN fps: {:.2f}".format(fps), 
+                               (2, aruco_overlay.shape[0] - 4), 
+                               cv2.FONT_HERSHEY_TRIPLEX, 0.4, (255, 0, 0))
+                    cv2.putText(aruco_overlay, "YOLO classes: {}".format(found_classes), 
+                               (2, 10), cv2.FONT_HERSHEY_TRIPLEX, 0.4, (255, 0, 0))
+                    cv2.putText(aruco_overlay, f"All detections tracked (conf>{self.min_confidence})", 
+                               (2, 25), cv2.FONT_HERSHEY_TRIPLEX, 0.4, (0, 255, 0))
+                    
+                    # Add ArUco status
+                    if self.aruco_detections:
+                        aruco_ids = list(self.aruco_detections.keys())
+                        cv2.putText(aruco_overlay, f"ArUco markers: {aruco_ids}", 
+                                   (2, 40), cv2.FONT_HERSHEY_TRIPLEX, 0.4, (0, 255, 0))
+                    
+                    # Add pose topic info
+                    cv2.putText(aruco_overlay, f"Pose: {self.drone_pose_topic}", 
+                               (2, 55), cv2.FONT_HERSHEY_TRIPLEX, 0.4, (0, 255, 255))
+                    
+                    # Publish frames
+                    self.publish_to_ros(frame)  # Original frame
+                    self.publish_detect_to_ros(aruco_overlay)  # Combined detection overlay
+                    self.publish_aruco_to_ros(aruco_overlay)  # ArUco specific topic
+                    self.publish_camera_info()
+
+                counter+=1
+                if (time.time() - start_time) > 1:
+                    fps = counter / (time.time() - start_time)
+                    counter = 0
+                    start_time = time.time()
+
+    def publish_to_ros(self, frame):
+        msg_out = CompressedImage()
+        msg_out.header.stamp = rospy.Time.now()
+        msg_out.format = "jpeg"
+        msg_out.header.frame_id = "home"
+        msg_out.data = np.array(cv2.imencode('.jpg', frame)[1]).tostring()
+        self.pub_image.publish(msg_out)
+        msg_img_raw = self.br.cv2_to_imgmsg(frame, encoding="bgr8")
+        self.pub_image_raw.publish(msg_img_raw)
+
+    def publish_detect_to_ros(self, frame):
+        msg_out = CompressedImage()
+        msg_out.header.stamp = rospy.Time.now()
+        msg_out.format = "jpeg"
+        msg_out.header.frame_id = "home"
+        msg_out.data = np.array(cv2.imencode('.jpg', frame)[1]).tostring()
+        self.pub_image_detect.publish(msg_out)
+    
+    def publish_aruco_to_ros(self, frame):
+        """Publish ArUco detection frame to dedicated topic"""
+        msg_out = CompressedImage()
+        msg_out.header.stamp = rospy.Time.now()
+        msg_out.format = "jpeg"
+        msg_out.header.frame_id = "home"
+        msg_out.data = np.array(cv2.imencode('.jpg', frame)[1]).tostring()
+        self.pub_aruco.publish(msg_out)
+        
+    def frameNorm(self, frame, bbox):
+        normVals = np.full(len(bbox), frame.shape[0])
+        normVals[::2] = frame.shape[1]
+        return (np.clip(np.array(bbox), 0, 1) * normVals).astype(int)
+
+    def show_yolo(self, frame, detections):
+        """Enhanced visualization showing all detections with class-specific styling"""
+        overlay = frame.copy()
+        
+        # Group detections by class for better visualization
+        class_detections = {0: [], 1: [], 2: [], 3: []}
+        for detection in detections:
+            if detection.confidence > self.min_confidence:
+                class_detections[detection.label].append(detection)
+        
+        # Draw detections for each class
+        for class_id in range(4):
+            detections_for_class = class_detections[class_id]
+            color = CLASS_COLORS.get(class_id, (255, 255, 255))
+            
+            for i, detection in enumerate(detections_for_class):
+                bbox = self.frameNorm(overlay, (detection.xmin, detection.ymin, detection.xmax, detection.ymax))
+                center_x = int((bbox[0] + bbox[2]) / 2)
+                center_y = int((bbox[1] + bbox[3]) / 2)
+                
+                # Thicker border for best detection of each class
+                thickness = 4 if i == 0 and len(detections_for_class) > 1 else 2
+                
+                cv2.rectangle(overlay, (bbox[0], bbox[1]), (bbox[2], bbox[3]), color, thickness)
+                cv2.circle(overlay, (center_x, center_y), 5, (0, 0, 255), -1)
+                
+                # Label with class name and confidence
+                label_text = f"{get_label_name(class_id)} {int(detection.confidence * 100)}%"
+                cv2.putText(overlay, label_text, (bbox[0] + 10, bbox[1] + 20), 
+                           cv2.FONT_HERSHEY_TRIPLEX, 0.5, color)
+                
+                # Show world coordinates for best detection of each class
+                if i == 0 and self.current_pose:  # Only for best detection
+                    world_pos = self.pixel_to_world(center_x, center_y)
+                    if world_pos:
+                        world_text = f"({world_pos[0]:.2f}, {world_pos[1]:.2f})"
+                        cv2.putText(overlay, world_text, (bbox[0] + 10, bbox[1] + 40),
+                                   cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1)
+                
+                # Add index number for multiple detections of same class
+                if len(detections_for_class) > 1:
+                    cv2.putText(overlay, f"#{i+1}", (bbox[2] - 25, bbox[1] + 15),
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1)
+        
+        return overlay
+
+    def createPipeline(self, nnPath):
+        pipeline = dai.Pipeline()
+        pipeline.setOpenVINOVersion(version=dai.OpenVINO.Version.VERSION_2022_1)
+        detection_nn = pipeline.create(dai.node.YoloDetectionNetwork)
+        detection_nn.setConfidenceThreshold(confidenceThreshold)
+        detection_nn.setNumClasses(classes)
+        detection_nn.setCoordinateSize(coordinates)
+        detection_nn.setAnchors(anchors)
+        detection_nn.setAnchorMasks(anchorMasks)
+        detection_nn.setIouThreshold(iouThreshold)
+        detection_nn.setBlobPath(nnPath)
+        detection_nn.setNumPoolFrames(4)
+        detection_nn.input.setBlocking(False)
+        detection_nn.setNumInferenceThreads(2)
+
+        if cam_source == 'rgb':
+            cam = pipeline.create(dai.node.ColorCamera)
+            cam.setPreviewSize(self.nn_shape_w,self.nn_shape_h)
+            cam.setInterleaved(False)
+            cam.preview.link(detection_nn.input)
+            cam.setColorOrder(dai.ColorCameraProperties.ColorOrder.BGR)
+            cam.setFps(20)
+            print("Using RGB camera...")
+        elif cam_source == 'left':
+            cam = pipeline.create(dai.node.MonoCamera)
+            cam.setBoardSocket(dai.CameraBoardSocket.LEFT)
+            print("Using BW Left cam")
+        elif cam_source == 'right':
+            cam = pipeline.create(dai.node.MonoCamera)
+            cam.setBoardSocket(dai.CameraBoardSocket.RIGHT)
+            print("Using BW Right cam")
+
+        if cam_source != 'rgb':
+            manip = pipeline.create(dai.node.ImageManip)
+            manip.setResize(self.nn_shape_w,self.nn_shape_h)
+            manip.setKeepAspectRatio(True)
+            manip.setFrameType(dai.RawImgFrame.Type.RGB888p)
+            cam.out.link(manip.inputImage)
+            manip.out.link(detection_nn.input)
+
+        xout_rgb = pipeline.create(dai.node.XLinkOut)
+        xout_rgb.setStreamName("nn_input")
+        xout_rgb.input.setBlocking(False)
+        detection_nn.passthrough.link(xout_rgb.input)
+
+        xinDet = pipeline.create(dai.node.XLinkOut)
+        xinDet.setStreamName("nn")
+        xinDet.input.setBlocking(False)
+        detection_nn.out.link(xinDet.input)
+
+        return pipeline
+
+    def shutdown(self):
+        cv2.destroyAllWindows()
+
+
+def main():
+    rospy.init_node('depthai_node')
+    dai_cam = DepthaiCamera()
+    while not rospy.is_shutdown():
+        dai_cam.run()
+    dai_cam.shutdown()
+
+if __name__ == '__main__':
+    main()

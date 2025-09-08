@@ -1,0 +1,17 @@
+<launch>
+    <!-- Launch YOLO detector with ROI publishing -->
+    <node name="yolo_detector" pkg="depthai_publisher" type="dai_publisher_yolov5_runner.py" output="screen">
+        <!-- Camera FOV parameters for OakD -->
+        <param name="camera_fov_h" value="69.4"/>
+        <param name="camera_fov_v" value="42.5"/>
+        <!-- Camera offset from drone center (if needed) -->
+        <param name="camera_offset_x" value="0.0"/>
+        <param name="camera_offset_y" value="0.0"/>
+    </node>
+    
+    <!-- Your waypoint navigation with ROI -->
+    <node name="waypoint_nav" pkg="spar_node" type="takeoff_wp_roi_bread" output="screen">
+        <param name="surveyAlt" value="2.0"/>
+        <!-- Other parameters as needed -->
+    </node>
+</launch>

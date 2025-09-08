@@ -83,7 +83,7 @@ class DepthaiCamera():
             video = device.getOutputQueue(
                 name="video", maxSize=1, blocking=False)
 
-            while True:
+            while not rospy.is_shutdown():
                 frame = video.get().getCvFrame()
 
                 self.publish_to_ros(frame)
