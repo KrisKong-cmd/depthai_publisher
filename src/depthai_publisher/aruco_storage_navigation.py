@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 
 """
-ArUco Marker Storage and Navigation System
+ArUco Marker Storage and Navigation System with ML Target Visualization
 This node handles:
 1. Storing ArUco marker positions (averaged over time)
-2. Publishing markers to RViz
-3. Navigation to selected markers with landing
+2. Storing ML target positions (fire, smoke, human, bag) - one per type
+3. Publishing markers and targets to RViz
+4. Navigation to selected ArUco markers with landing
 """
 
 import rospy
@@ -40,9 +41,34 @@ class ArUcoStorageNavigation:
         # Get the pose topic from parameter (can be /uavasr/pose for sim or /mavros/local_position/pose for real)
         self.drone_pose_topic = rospy.get_param("~drone_pose_topic", "/uavasr/pose")
         
-        # Storage for ArUco markers
+        # Storage for ArUco markers (can have multiple)
         self.stored_markers = {}  # {marker_id: {'position': Point, 'detections': [(x,y,z,timestamp)], 'last_update': timestamp}}
         self.marker_lock = threading.Lock()
+        
+        # Storage for ML targets - ONLY ONE PER TYPE (latest detection replaces previous)
+        self.ml_targets = {
+            'bag': None,    # Will store {'position': Point, 'detections': [(x,y,z,timestamp)], 'last_update': timestamp, 'detection_count': int}
+            'fire': None,
+            'human': None,
+            'smoke': None
+        }
+        self.ml_lock = threading.Lock()
+        
+        # ML target colors matching the YOLO visualization
+        self.ml_colors = {
+            'bag': ColorRGBA(r=0.0, g=1.0, b=0.0, a=0.8),      # Green
+            'fire': ColorRGBA(r=1.0, g=0.0, b=0.0, a=0.8),     # Red
+            'human': ColorRGBA(r=0.0, g=0.0, b=1.0, a=0.8),    # Blue
+            'smoke': ColorRGBA(r=1.0, g=1.0, b=0.0, a=0.8)     # Yellow
+        }
+        
+        # ML target marker shapes
+        self.ml_shapes = {
+            'bag': Marker.CUBE,
+            'fire': Marker.SPHERE,
+            'human': Marker.CYLINDER,
+            'smoke': Marker.SPHERE
+        }
         
         # Current drone position
         self.current_pose = None
@@ -55,15 +81,28 @@ class ArUcoStorageNavigation:
         self.spar_client.wait_for_server()
         rospy.loginfo("Connected to SPAR")
         
-        # Interactive marker server for RViz
+        # Interactive marker server for RViz (ArUco only)
         self.marker_server = InteractiveMarkerServer("aruco_markers")
         
         # Publishers
         self.pub_marker_array = rospy.Publisher('/aruco_markers/visualization', MarkerArray, queue_size=10, latch=True)
+        self.pub_ml_targets = rospy.Publisher('/ml_targets/visualization', MarkerArray, queue_size=10, latch=True)
         self.pub_status = rospy.Publisher('/aruco_navigation/status', String, queue_size=10)
         
-        # Subscribers
+        # Subscribers for ArUco
         self.sub_aruco_roi = rospy.Subscriber('/aruco_detection/roi', PoseStamped, self.aruco_roi_callback)
+        
+        # Subscribers for ML targets
+        self.sub_bag_roi = rospy.Subscriber('/yolo_detection/roi/bag', PoseStamped, 
+                                           lambda msg: self.ml_roi_callback(msg, 'bag'))
+        self.sub_fire_roi = rospy.Subscriber('/yolo_detection/roi/fire', PoseStamped, 
+                                            lambda msg: self.ml_roi_callback(msg, 'fire'))
+        self.sub_human_roi = rospy.Subscriber('/yolo_detection/roi/human', PoseStamped, 
+                                             lambda msg: self.ml_roi_callback(msg, 'human'))
+        self.sub_smoke_roi = rospy.Subscriber('/yolo_detection/roi/smoke', PoseStamped, 
+                                             lambda msg: self.ml_roi_callback(msg, 'smoke'))
+        
+        # Subscriber for drone pose
         self.sub_drone_pose = rospy.Subscriber(self.drone_pose_topic, PoseStamped, self.pose_callback)
         
         rospy.loginfo(f"Using drone pose topic: {self.drone_pose_topic}")
@@ -72,12 +111,14 @@ class ArUcoStorageNavigation:
         signal.signal(signal.SIGINT, self.signal_handler)
         signal.signal(signal.SIGTERM, self.signal_handler)
         
-        # Timer to update averaged positions
-        self.update_timer = rospy.Timer(rospy.Duration(1.0), self.update_averaged_positions)
+        # Timer to update averaged positions and publish to RViz
+        self.update_timer = rospy.Timer(rospy.Duration(1.0), self.update_and_publish_all)
         
-        rospy.loginfo("ArUco Storage and Navigation System initialized")
+        rospy.loginfo("ArUco Storage and Navigation System with ML Target Visualization initialized")
         rospy.loginfo(f"Configured for pose topic: {self.drone_pose_topic}")
-        rospy.loginfo("Click on markers in RViz to navigate and land")
+        rospy.loginfo("Visualizing: ArUco markers (interactive) and ML targets (bag, fire, human, smoke)")
+        rospy.loginfo("ML targets: ONE per type - latest detection replaces previous")
+        rospy.loginfo("Click on ArUco markers in RViz to navigate and land")
         rospy.loginfo("Press Ctrl+C to cancel navigation and shutdown")
         
     def signal_handler(self, signum, frame):
@@ -110,21 +151,27 @@ class ArUcoStorageNavigation:
             current_time = rospy.Time.now().to_sec()
             
             # Check if this is a new detection location or existing one
-            for marker_id, data in self.stored_markers.items():
+            for existing_id, data in self.stored_markers.items():
                 # Check if position is close to existing marker (within 0.5m)
                 dist = np.sqrt((data['position'].x - msg.pose.position.x)**2 + 
                              (data['position'].y - msg.pose.position.y)**2)
-                if dist < 0.5:
-                    # Update existing marker
-                    marker_key = marker_id
-                    break
+                if dist < 0.5 and not existing_id.startswith("ID_"):
+                    # Update existing position-based marker if we now have an ID
+                    if marker_key.startswith("ID_"):
+                        # Remove old position-based key and use ID-based key
+                        self.stored_markers[marker_key] = self.stored_markers.pop(existing_id)
+                        break
+                    else:
+                        marker_key = existing_id
+                        break
             
             if marker_key not in self.stored_markers:
                 # New marker detected
                 self.stored_markers[marker_key] = {
                     'position': Point(x=msg.pose.position.x, y=msg.pose.position.y, z=msg.pose.position.z),
                     'detections': [],
-                    'last_update': current_time
+                    'last_update': current_time,
+                    'first_seen': current_time
                 }
                 rospy.loginfo(f"New ArUco marker stored: {marker_key}")
             
@@ -134,43 +181,184 @@ class ArUcoStorageNavigation:
             )
             self.stored_markers[marker_key]['last_update'] = current_time
             
-            # Keep only recent detections (within averaging window)
+            # Keep only recent detections (within averaging window) for position calculation
             cutoff_time = current_time - self.averaging_window
             self.stored_markers[marker_key]['detections'] = [
                 d for d in self.stored_markers[marker_key]['detections'] if d[3] > cutoff_time
             ]
     
-    def update_averaged_positions(self, event):
-        """Update averaged positions and publish to RViz"""
+    def ml_roi_callback(self, msg, target_type):
+        """Receive ML target detection ROI and store it - ONLY ONE PER TYPE"""
+        with self.ml_lock:
+            current_time = rospy.Time.now().to_sec()
+            
+            # Check if we should update the existing target or replace it
+            if self.ml_targets[target_type] is None:
+                # First detection of this type
+                self.ml_targets[target_type] = {
+                    'position': Point(x=msg.pose.position.x, y=msg.pose.position.y, z=0.0),
+                    'detections': [],
+                    'last_update': current_time,
+                    'first_seen': current_time,
+                    'detection_count': 0
+                }
+                rospy.loginfo(f"First {target_type} target detected at ({msg.pose.position.x:.2f}, {msg.pose.position.y:.2f})")
+            else:
+                # Check distance to existing target
+                existing_pos = self.ml_targets[target_type]['position']
+                dist = np.sqrt((existing_pos.x - msg.pose.position.x)**2 + 
+                             (existing_pos.y - msg.pose.position.y)**2)
+                
+                if dist > 2.0:  # If more than 2 meters away, it's a new target location
+                    # Replace with new target
+                    self.ml_targets[target_type] = {
+                        'position': Point(x=msg.pose.position.x, y=msg.pose.position.y, z=0.0),
+                        'detections': [],
+                        'last_update': current_time,
+                        'first_seen': current_time,
+                        'detection_count': 0
+                    }
+                    rospy.loginfo(f"New {target_type} location detected at ({msg.pose.position.x:.2f}, {msg.pose.position.y:.2f}), replacing previous")
+            
+            # Add detection to history for averaging
+            self.ml_targets[target_type]['detections'].append(
+                (msg.pose.position.x, msg.pose.position.y, 0.0, current_time)
+            )
+            self.ml_targets[target_type]['last_update'] = current_time
+            self.ml_targets[target_type]['detection_count'] += 1
+            
+            # Keep only recent detections for averaging (within averaging window)
+            cutoff_time = current_time - self.averaging_window
+            self.ml_targets[target_type]['detections'] = [
+                d for d in self.ml_targets[target_type]['detections'] if d[3] > cutoff_time
+            ]
+    
+    def update_and_publish_all(self, event):
+        """Update averaged positions and publish everything to RViz"""
+        # Update and publish ArUco markers
+        self.publish_aruco_markers()
+        
+        # Update and publish ML targets
+        self.publish_ml_targets()
+    
+    def publish_aruco_markers(self):
+        """Update and publish ArUco markers to RViz"""
         with self.marker_lock:
             marker_array = MarkerArray()
-            marker_id = 0
             
+            # First, add delete markers for all possible IDs to clear old ones
+            for i in range(100):  # Assuming max 50 ArUco markers (2 IDs each)
+                delete_marker = Marker()
+                delete_marker.header.frame_id = "map"
+                delete_marker.ns = "aruco_markers"
+                delete_marker.id = i
+                delete_marker.action = Marker.DELETE
+                marker_array.markers.append(delete_marker)
+                
+                delete_text = Marker()
+                delete_text.header.frame_id = "map"
+                delete_text.ns = "aruco_labels"
+                delete_text.id = i + 1000
+                delete_text.action = Marker.DELETE
+                marker_array.markers.append(delete_text)
+            
+            # Now add current markers
+            marker_id = 0
             for marker_key, data in self.stored_markers.items():
                 if len(data['detections']) > 0:
-                    # Calculate average position
+                    # Calculate average position from recent detections
                     avg_x = np.mean([d[0] for d in data['detections']])
                     avg_y = np.mean([d[1] for d in data['detections']])
                     avg_z = np.mean([d[2] for d in data['detections']])
                     
                     # Update stored position
                     data['position'] = Point(x=avg_x, y=avg_y, z=avg_z)
-                    
-                    # Create visualization marker
-                    viz_marker = self.create_visualization_marker(marker_id, marker_key, data['position'])
-                    marker_array.markers.append(viz_marker)
-                    
-                    # Update interactive marker
-                    self.update_interactive_marker(marker_key, data['position'])
-                    
-                    marker_id += 1
+                else:
+                    # Use last known position if no recent detections
+                    avg_x = data['position'].x
+                    avg_y = data['position'].y
+                    avg_z = data['position'].z
+                
+                # Create visualization marker
+                viz_marker = self.create_aruco_visualization_marker(marker_id, marker_key, data['position'])
+                marker_array.markers.append(viz_marker)
+                
+                # Create text label
+                time_since = rospy.Time.now().to_sec() - data['last_update']
+                label = f"ArUco {marker_key}\n({avg_x:.1f}, {avg_y:.1f})\nLast: {time_since:.0f}s ago"
+                text_marker = self.create_text_marker(marker_id + 1000, label, 
+                                                     Point(x=avg_x, y=avg_y, z=avg_z + 0.3),
+                                                     ColorRGBA(r=1.0, g=1.0, b=1.0, a=1.0),
+                                                     "aruco_labels")
+                marker_array.markers.append(text_marker)
+                
+                # Update interactive marker
+                self.update_interactive_marker(marker_key, data['position'])
+                
+                marker_id += 1
             
-            # Publish visualization
+            # Publish ArUco visualization
             self.pub_marker_array.publish(marker_array)
             self.marker_server.applyChanges()
     
-    def create_visualization_marker(self, marker_id, marker_key, position):
-        """Create a visualization marker for RViz"""
+    def publish_ml_targets(self):
+        """Publish ML targets to RViz - one per type, persistent"""
+        with self.ml_lock:
+            ml_marker_array = MarkerArray()
+            
+            # Clear any old markers first
+            for i in range(8):  # 4 target types * 2 markers each
+                delete_marker = Marker()
+                delete_marker.header.frame_id = "map"
+                delete_marker.ns = "ml_targets"
+                delete_marker.id = i
+                delete_marker.action = Marker.DELETE
+                ml_marker_array.markers.append(delete_marker)
+                
+                delete_text = Marker()
+                delete_text.header.frame_id = "map"
+                delete_text.ns = "ml_labels"
+                delete_text.id = i + 5000
+                delete_text.action = Marker.DELETE
+                ml_marker_array.markers.append(delete_text)
+            
+            # Add current ML targets
+            ml_marker_id = 0
+            for target_type in ['bag', 'fire', 'human', 'smoke']:
+                if self.ml_targets[target_type] is not None:
+                    data = self.ml_targets[target_type]
+                    
+                    # Calculate average position if we have recent detections
+                    if len(data['detections']) > 0:
+                        avg_x = np.mean([d[0] for d in data['detections']])
+                        avg_y = np.mean([d[1] for d in data['detections']])
+                        # Update stored position with averaged value
+                        data['position'] = Point(x=avg_x, y=avg_y, z=0.0)
+                    else:
+                        # Use last known position
+                        avg_x = data['position'].x
+                        avg_y = data['position'].y
+                    
+                    # Create ML target visualization marker
+                    ml_marker = self.create_ml_target_marker(ml_marker_id, target_type, data['position'])
+                    ml_marker_array.markers.append(ml_marker)
+                    
+                    # Create text label with info
+                    time_since = rospy.Time.now().to_sec() - data['last_update']
+                    label = f"{target_type.upper()}\n({avg_x:.1f}, {avg_y:.1f})\nDetections: {data['detection_count']}\nLast: {time_since:.0f}s ago"
+                    text_marker = self.create_text_marker(ml_marker_id + 5000, label, 
+                                                         Point(x=avg_x, y=avg_y, z=0.5),
+                                                         ColorRGBA(r=1.0, g=1.0, b=1.0, a=1.0),
+                                                         "ml_labels")
+                    ml_marker_array.markers.append(text_marker)
+                    
+                    ml_marker_id += 1
+            
+            # Publish ML target visualization
+            self.pub_ml_targets.publish(ml_marker_array)
+    
+    def create_aruco_visualization_marker(self, marker_id, marker_key, position):
+        """Create a visualization marker for ArUco in RViz"""
         marker = Marker()
         marker.header.frame_id = "map"
         marker.header.stamp = rospy.Time.now()
@@ -188,24 +376,63 @@ class ArUcoStorageNavigation:
         
         marker.color = ColorRGBA(r=0.0, g=1.0, b=0.0, a=0.8)
         
-        marker.lifetime = rospy.Duration(5.0)  # Marker expires after 5 seconds if not updated
-        
-        # Add text label
-        text_marker = Marker()
-        text_marker.header = marker.header
-        text_marker.ns = "aruco_labels"
-        text_marker.id = marker_id + 1000
-        text_marker.type = Marker.TEXT_VIEW_FACING
-        text_marker.action = Marker.ADD
-        text_marker.pose.position.x = position.x
-        text_marker.pose.position.y = position.y
-        text_marker.pose.position.z = position.z + 0.3
-        text_marker.scale.z = 0.2
-        text_marker.color = ColorRGBA(r=1.0, g=1.0, b=1.0, a=1.0)
-        text_marker.text = f"ArUco\n{marker_key}"
-        text_marker.lifetime = rospy.Duration(5.0)
+        # No lifetime - markers persist indefinitely
+        marker.lifetime = rospy.Duration(0)
         
         return marker
+    
+    def create_ml_target_marker(self, marker_id, target_type, position):
+        """Create a visualization marker for ML targets in RViz"""
+        marker = Marker()
+        marker.header.frame_id = "map"
+        marker.header.stamp = rospy.Time.now()
+        marker.ns = "ml_targets"
+        marker.id = marker_id
+        marker.type = self.ml_shapes[target_type]
+        marker.action = Marker.ADD
+        
+        marker.pose.position = position
+        marker.pose.orientation.w = 1.0
+        
+        # Different sizes for different target types
+        if target_type == 'human':
+            marker.scale.x = 0.3
+            marker.scale.y = 0.3
+            marker.scale.z = 0.6
+        elif target_type == 'bag':
+            marker.scale.x = 0.4
+            marker.scale.y = 0.3
+            marker.scale.z = 0.3
+        else:  # fire, smoke
+            marker.scale.x = 0.4
+            marker.scale.y = 0.4
+            marker.scale.z = 0.4
+        
+        marker.color = self.ml_colors[target_type]
+        
+        # No lifetime - markers persist indefinitely
+        marker.lifetime = rospy.Duration(0)
+        
+        return marker
+    
+    def create_text_marker(self, marker_id, text, position, color, ns):
+        """Create a text label marker"""
+        text_marker = Marker()
+        text_marker.header.frame_id = "map"
+        text_marker.header.stamp = rospy.Time.now()
+        text_marker.ns = ns
+        text_marker.id = marker_id
+        text_marker.type = Marker.TEXT_VIEW_FACING
+        text_marker.action = Marker.ADD
+        text_marker.pose.position = position
+        text_marker.scale.z = 0.15
+        text_marker.color = color
+        text_marker.text = text
+        
+        # No lifetime - text persists indefinitely
+        text_marker.lifetime = rospy.Duration(0)
+        
+        return text_marker
     
     def update_interactive_marker(self, marker_key, position):
         """Create or update an interactive marker for clicking in RViz"""

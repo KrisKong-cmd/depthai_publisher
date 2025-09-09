@@ -1,7 +1,7 @@
 <!-- aruco_navigation_robust.launch -->
 <launch>
     <!-- Flight Mode Parameter: "simulation" or "real" -->
-    <arg name="flight_mode" default="simulation" />
+    <arg name="flight_mode" default="real" />
     
     <!-- Determine pose topic based on flight mode -->
     <arg name="drone_pose_topic" value="/uavasr/pose" if="$(eval arg('flight_mode') == 'simulation')" />

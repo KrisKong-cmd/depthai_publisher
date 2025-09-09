@@ -93,12 +93,11 @@ class DepthaiCamera():
          # Input image size
         if "input_size" in nnConfig:
             self.nn_shape_w, self.nn_shape_h = tuple(map(int, nnConfig.get("input_size").split('x')))
-        
-        # Publish speak stuff
+
+         # Publish speak stuff
         self.tts_pub = rospy.Publisher('/speak_this', String, queue_size=10)
         self.last_spoken = {}  # cooldown tracker
         self.cooldown = rospy.Duration(30.0)
-        
         
         # Publish ros image data
         self.pub_image = rospy.Publisher(self.pub_topic, CompressedImage, queue_size=10)
@@ -138,8 +137,6 @@ class DepthaiCamera():
         rospy.loginfo("  /yolo_detection/roi/smoke")
         rospy.loginfo("  /yolo_detection/roi/all (all detections)")
         rospy.loginfo("  /aruco_detection/roi (ArUco markers)")
-        rospy.loginfo("Publishing RViz visualization markers:")
-        rospy.loginfo("  /ml_targets/visualization (ML target 3D markers)")
 
         self.br = CvBridge()
         
@@ -218,23 +215,19 @@ class DepthaiCamera():
         return (world_x, world_y)
     
     def publish_roi_detection(self, center_x, center_y, class_id, confidence):
-        world_pos = self.pixel_to_world(center_x, center_y)
-        
-        label = get_label_name(class_id)
-        
-      
-            
         """Publish ROI detection for a specific class"""
         if not self.current_pose:
             return
         
+        world_pos = self.pixel_to_world(center_x, center_y)
+        
+        # Speak detection with cooldown
+        label = get_label_name(class_id)
         key = f"{label}_{int(world_pos[0]*10)}_{int(world_pos[1]*10)}"  # round pos for cooldown
         message = f"{label} detected at {world_pos[0]:.1f}, {world_pos[1]:.1f}"
         if self.should_speak(key):
             self.tts_pub.publish(message)
-        
-        
-        
+            
         if world_pos:
             roi_msg = PoseStamped()
             roi_msg.header.stamp = rospy.Time.now()
@@ -257,8 +250,6 @@ class DepthaiCamera():
             rospy.loginfo(f"ROI: {get_label_name(class_id)} at ({world_pos[0]:.2f}, {world_pos[1]:.2f}) conf:{confidence:.2f}")
     
     def publish_aruco_roi(self, center_x, center_y, marker_id):
-        
-        
         """Publish ROI detection for ArUco marker with ID in header"""
     
         if not self.current_pose:
@@ -266,14 +257,11 @@ class DepthaiCamera():
     
         world_pos = self.pixel_to_world(center_x, center_y)
         
-        
         # aruco vocal stuff
         key = f"aruco_{marker_id}"
         message = f"ArUco marker {marker_id} at {world_pos[0]:.1f}, {world_pos[1]:.1f}"
         if self.should_speak(key):
             self.tts_pub.publish(message)
-
-        
         
         if world_pos:
             roi_msg = PoseStamped()
